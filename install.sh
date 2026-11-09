@@ -43,6 +43,7 @@ X-KDE-AutostartScript=true
 EOF
 
 kwriteconfig6 --file kwinrc --group Plugins --key "${SCRIPT_ID}Enabled" true --notify
+systemctl --user daemon-reload 2>/dev/null || true
 
 if [ "$RELOAD" = 1 ]; then
     qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$SCRIPT_ID" >/dev/null 2>&1 || true
@@ -52,7 +53,7 @@ if [ "$RELOAD" = 1 ]; then
 fi
 
 UNIT="$(systemctl --user list-units --all --plain --no-legend 2>/dev/null \
-    | awk '/windowbridge-receiver\.py@autostart\.service/ {print $1; exit}')"
+    | awk '/receiver\.py@autostart\.service/ {print $1; exit}' || true)"
 if [ -n "$UNIT" ]; then
     systemctl --user restart "$UNIT"
 else
