@@ -10,7 +10,6 @@ KWIN_SCRIPTS="$DATA_HOME/kwin/scripts/$SCRIPT_ID"
 RECEIVER_DIR="${KWB_RECEIVER_DIR:-$HOME/.scripts}"
 RECEIVER="$RECEIVER_DIR/kwin-artemis-windowbridge-receiver.py"
 AUTOSTART="$CONFIG_HOME/autostart/kwin-artemis-windowbridge-receiver.py.desktop"
-PORT="${KWB_NIGHTLIGHT_PORT:-8484}"
 PY="${PYTHON:-/usr/bin/python3}"
 RELOAD=1
 
@@ -71,4 +70,3 @@ else
 fi
 echo "KWin script: $KWIN_SCRIPTS"
 echo "receiver:    $RECEIVER"
-echo "control API: http://127.0.0.1:$PORT/nightlight"

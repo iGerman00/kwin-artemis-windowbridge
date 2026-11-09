@@ -1,21 +1,29 @@
 # KWin Artemis WindowBridge
 
-KWin 6 ↔ Artemis RGB bridge. The focused window and the Night Light state go into Artemis as JSON modules; the Night Light temperature can be driven back over HTTP or D-Bus.
+Bridge from KWin 6 to Artemis RGB. The focused window and the Night Light state go out as JSON modules. Read-only: KWin keeps control of Night Light.
 
-```
-KWin script ──WindowChanged(json)──▶ receiver ──HTTP──▶ Artemis (kwin_window, kwin_nightlight)
-KWin NightLight D-Bus ──PropertiesChanged──▶ receiver
-                     HTTP 127.0.0.1:8484 ────┘  set temperature / enabled / mode
+```mermaid
+flowchart LR
+    subgraph KWin
+        Script["KWin script"]
+        NightLight["Night Light<br/>org.kde.KWin.NightLight"]
+    end
+    Receiver["receiver"]
+    Artemis["Artemis<br/>kwin_window, kwin_nightlight"]
+
+    Script -->|"WindowChanged(json)"| Receiver
+    NightLight -->|"PropertiesChanged"| Receiver
+    Receiver -->|"HTTP :9696"| Artemis
 ```
 
-- `metadata.json`, `contents/code/main.js` — KWin script. Emits a 59-field snapshot of the active window on activation and on caption, caption-normal, minimized and fullscreen changes.
-- `kwin-artemis-windowbridge-receiver.py` — owns the `org.kde.kwin.WindowBridge` D-Bus name, forwards windows to Artemis, watches `org.kde.KWin.NightLight`, publishes its state and serves the control API.
+- `metadata.json`, `contents/code/main.js`: the KWin script. Sends a 59-field snapshot of the active window on activation. It sends it again on caption, caption-normal, minimize and fullscreen changes.
+- `kwin-artemis-windowbridge-receiver.py`: owns the `org.kde.kwin.WindowBridge` D-Bus name and forwards windows to Artemis. It also watches `org.kde.KWin.NightLight` and serves the control API.
 
 ## Requirements
 
 - KDE Plasma 6 / KWin 6
 - `python3` with `dbus-python`, `PyGObject` (`gi`), `requests`
-- Artemis RGB with the Web API plugin enabled (`http://localhost:9696`)
+- Artemis RGB with the Web API plugin enabled, on `http://localhost:9696`
 
 ## Install
 
@@ -23,39 +31,21 @@ KWin NightLight D-Bus ──PropertiesChanged──▶ receiver
 ./install.sh            # --no-reload skips the KWin reload
 ```
 
-Installs the KWin script to `~/.local/share/kwin/scripts/kwin-artemis-windowbridge`, the receiver to `~/.scripts/` (override with `KWB_RECEIVER_DIR`), writes an autostart entry, enables the script in `kwinrc` and reloads it.
+Installs the KWin script to `~/.local/share/kwin/scripts/kwin-artemis-windowbridge` and the receiver to `~/.scripts/` (change with `KWB_RECEIVER_DIR`). It then writes an autostart unit, enables the script in `kwinrc` and reloads KWin.
 
-## Artemis data
+## Artemis modules
 
-`kwin_window` — the window snapshot: caption, resourceName/Class, pid, geometry, output, flags, desktops.
+`kwin_window` is the window snapshot: caption, resourceName/Class, pid, geometry, output, flags, desktops.
 
-`kwin_nightlight` — Night Light state. `currentTemperature` is KWin's *animated* value: it follows transitions in 50 K steps (~13 updates/s), so no interpolation is needed. Derived fields:
+`kwin_nightlight` is the Night Light state. `currentTemperature` is KWin's animated value, so a transition arrives as 50 K steps at about 13 updates per second. Nothing needs interpolating.
 
-- `warmth` — 0 at the day temperature, 1 at the configured night temperature
-- `colorRed`/`colorGreen`/`colorBlue` (0-255, integer) and `gainRed`/`gainGreen`/`gainBlue` (0..1, number) — KWin's own white-point table at `currentTemperature`. `colorHex` is the same value as a string for humans; colour node inputs need the numbers.
-- `mulRed`/`mulGreen`/`mulBlue` (0-255, integer) — the same tint as bytes for a Multiply layer: `255 * gain^(1/tintGamma)`. KWin's entries are gamma-corrected and the gain is applied to linear light, so the raw entries are 2.2× too warm on the wire; a Multiply layer wants these, not `color*`. `tintGamma` reports the exponent (`KWB_TINT_GAMMA`, default 2.2).
-- `enabled`, `running`, `active`, `inhibited`, `daylight`, `modeName`, `targetTemperature`, `dayTemperature`, `nightTemperature`, `transitionActive`, `transitionRemainingMs`, transition timestamps, `previewActive`
+Fields:
 
-## Control
-
-Base URL `http://127.0.0.1:8484` (override with `KWB_NIGHTLIGHT_PORT`).
-
-| Call | Effect |
-| --- | --- |
-| `GET /nightlight` | state |
-| `POST /nightlight {"temperature": 3000}` | persistent `[NightColor] NightTemperature` |
-| `POST /nightlight {"enabled": false}` | `[NightColor] Active` |
-| `POST /nightlight {"mode": "constant"}` | `0` = constant, `1` = darklight |
-| `POST /nightlight {"temperature": 3000, "applyNow": true}` | constant + enabled + temperature |
-| `POST /nightlight/preview {"temperature": 3000}` | 15 s preview, then KWin reverts |
-| `POST /nightlight/preview/stop` | cancel preview |
-| `GET /health` | liveness |
-
-D-Bus equivalents on `/org/kde/kwin/WindowBridge`: `GetNightLightState`, `SetNightLightTemperature`, `PreviewNightLightTemperature`, `StopNightLightPreview`, signal `NightLightChanged`.
+- `warmth`: 0 at `dayTemperature`, 1 at `nightTemperature`.
+- `colorRed`/`colorGreen`/`colorBlue` (integer 0-255) and `gainRed`/`gainGreen`/`gainBlue` (number 0..1): KWin's white-point table at `currentTemperature`. `colorHex` is the same as a string; node inputs need the numbers.
+- `mulRed`/`mulGreen`/`mulBlue` (integer 0-255): the same tint for a Multiply layer, `255 * gain^(1/tintGamma)`. The table entries are gamma-corrected and the gain lands on linear light, so using `colorRed`/`colorGreen`/`colorBlue` as a Multiply colour comes out 2.2x too warm. `tintGamma` reports the exponent (`KWB_TINT_GAMMA`, default 2.2).
+- `enabled`, `running`, `active`, `inhibited`, `daylight`, `modeName`, `targetTemperature`, `dayTemperature`, `nightTemperature`, `transitionActive`, `transitionRemainingMs` and the transition timestamps.
 
 ## Notes
 
-- KWin has no D-Bus setter for the configured temperature. Persistent changes write `kwinrc [NightColor]` with `kwriteconfig6 --notify`; without `--notify` KWin keeps its cached settings and nothing moves.
-- In `darklight` mode the night temperature only applies at night; use `applyNow` (or `mode=constant`) to force it now.
-- `preview()` shows a "Color Temperature Preview" OSD and reverts after 15 s.
-- KWin scripts cannot subscribe to D-Bus properties and have no timers, so the Night Light half lives in the receiver.
+- KWin scripts have no timers and cannot subscribe to D-Bus properties, so the Night Light side lives in the receiver.

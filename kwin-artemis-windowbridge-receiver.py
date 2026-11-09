@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""KWin -> Artemis bridge: active window info + Night Light state/control.
+"""KWin -> Artemis bridge: active window info + Night Light state.
 
-Window half (unchanged)
+Window half
     The KWin script calls WindowChanged(json) on org.kde.kwin.WindowBridge
     (/org/kde/kwin/WindowBridge) on every activation/title change; the payload is
     forwarded to Artemis' JSON module `kwin_window`.
 
-Night Light half (new in 2.0)
+Night Light half
     KWin publishes its Night Light state on org.kde.KWin
     /org/kde/KWin/NightLight. `currentTemperature` is the *animated* value, so it
     already reflects a transition in progress: while a transition runs KWin emits
@@ -15,47 +15,21 @@ Night Light half (new in 2.0)
     for a multiply-blend layer) is published to the Artemis JSON module
     `kwin_nightlight`, throttled to one POST per 80 ms.
 
-    KWin's D-Bus interface has no setter for the configured temperature, so:
-      - persistent change  -> write kwinrc [NightColor] (KConfigWatcher reloads it
-                              in KWin and quick-adjusts the screen)
-      - momentary change   -> NightLight.preview(K), which KWin reverts after 15 s
-                              and which also shows a "Color Temperature Preview" OSD
+    Read-only on purpose: the temperature, schedule and enabled state belong to
+    KWin and the Plasma applet, so nothing here writes to them.
 
-Control surface (loopback only)
-    HTTP 127.0.0.1:8484 (override with KWB_NIGHTLIGHT_PORT)
-        GET  /nightlight                      -> state
-        POST /nightlight                      {"temperature": 3000}
-             keys: temperature | nightTemperature  (1000-6500 K)
-                   enabled                        (bool, [NightColor] Active)
-                   mode                           ("constant" | "darklight")
-                   applyNow                       (bool: mode=constant + enabled,
-                                                   so the temperature applies now)
-             -> {"ok": true, "applied": bool, "wrote": {...}, "state": {...}}
-        POST /nightlight/preview              {"temperature": 3000}   # 15 s
-        POST /nightlight/preview/stop
-        GET  /health
-
-    D-Bus (same service object as the window bridge)
-        GetNightLightState() -> s
-        SetNightLightTemperature(u) -> s
-        PreviewNightLightTemperature(u)
-        StopNightLightPreview()
-        signal NightLightChanged(s)
-
-    Range note: KWin clamps the temperature to 1000..6500 K. In "darklight" mode
-    the configured night temperature only takes effect at night (day target is
-    DayTemperature); pass applyNow/mode=constant to force it immediately.
+D-Bus (same service object as the window bridge)
+    GetNightLightState() -> s
+    signal NightLightChanged(s)
 """
 
 import configparser
 import json
 import math
 import os
-import subprocess
 import threading
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import dbus
@@ -64,7 +38,7 @@ import dbus.service
 import requests
 from gi.repository import GLib
 
-BRIDGE_VERSION = "2.1.0"
+BRIDGE_VERSION = "2.2.0"
 
 ARTEMIS_BASE_URL = "http://localhost:9696"
 WINDOW_MODULE_ID = "kwin_window"
@@ -84,7 +58,6 @@ MIN_TEMPERATURE = 1000
 MAX_TEMPERATURE = 6500
 DEFAULT_DAY_TEMPERATURE = 6500
 DEFAULT_NIGHT_TEMPERATURE = 4500
-PREVIEW_SECONDS = 15
 
 # Night Light is a gain applied to *linear* light, but the bytes Artemis passes
 # around are gamma encoded: a linear gain g reaches the wire as g**(1/gamma).
@@ -98,9 +71,6 @@ TINT_GAMMA = float(os.environ.get("KWB_TINT_GAMMA", "2.2"))
 # POST per 80 ms keeps the module in sync without flooding the web server.
 PUBLISH_INTERVAL_MS = 80
 HEARTBEAT_SECONDS = 5
-
-CONTROL_HOST = "127.0.0.1"
-CONTROL_PORT = int(os.environ.get("KWB_NIGHTLIGHT_PORT", "8484"))
 
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 KWINRC = CONFIG_HOME / "kwinrc"
@@ -590,16 +560,6 @@ NIGHTLIGHT_SCHEMA = {
             "title": "Next Transition Duration (ms)",
             "description": "Length of the next scheduled transition"
         },
-        "previewActive": {
-            "type": "boolean",
-            "title": "Preview Active",
-            "description": "A preview requested through this bridge is running"
-        },
-        "previewTemperature": {
-            "type": "integer",
-            "title": "Preview Temperature (K)",
-            "description": "Temperature of the running preview (0 when none)"
-        },
         "updatedAt": {
             "type": "string",
             "title": "Updated At",
@@ -747,30 +707,8 @@ def read_nightcolor_config():
     return values
 
 
-def run_in_mainloop(fn, *args, timeout=6.0):
-    """Execute fn on the GLib main loop (where the D-Bus connection lives)."""
-    box = {}
-    done = threading.Event()
-
-    def job():
-        try:
-            box["value"] = fn(*args)
-        except BaseException as exc:  # noqa: BLE001 - forwarded to the caller
-            box["error"] = exc
-        finally:
-            done.set()
-        return False
-
-    GLib.idle_add(job)
-    if not done.wait(timeout):
-        raise TimeoutError("main loop did not answer in time")
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
-
-
 class NightLight:
-    """Reads KWin Night Light state and applies temperature changes."""
+    """Reads KWin Night Light state; never writes to it."""
 
     def __init__(self, bus, on_publish):
         self._bus = bus
@@ -778,14 +716,11 @@ class NightLight:
         self._props = {"available": False}
         self._config = read_nightcolor_config()
         self._config_stamp = self._config_mtime()
-        self._preview_temperature = 0
-        self._preview_until = 0.0
         self._flush_source = 0
         self._last_signature = None
         self._owner_initialized = False
         self._kwin_obj = bus.get_object(KWIN_SERVICE, NIGHTLIGHT_PATH, introspect=False)
         self._props_iface = dbus.Interface(self._kwin_obj, PROPS_IFACE)
-        self._nl_iface = dbus.Interface(self._kwin_obj, NIGHTLIGHT_IFACE)
         bus.watch_name_owner(KWIN_SERVICE, self._on_kwin_owner_changed)
         bus.add_signal_receiver(
             self._on_properties_changed,
@@ -864,9 +799,6 @@ class NightLight:
         except Exception:
             return default
 
-    def preview_active(self):
-        return self._preview_temperature > 0 and time.time() < self._preview_until
-
     def state(self):
         cfg = self._reload_config()
         current = self._int_prop("currentTemperature", cfg["nightTemperature"])
@@ -900,7 +832,6 @@ class NightLight:
             else:
                 remaining = 0
 
-        preview_active = self.preview_active()
         return {
             "available": self._bool_prop("available", False),
             "enabled": enabled,
@@ -932,8 +863,6 @@ class NightLight:
             "previousTransitionDuration": self._int_prop("previousTransitionDuration", 0),
             "scheduledTransitionDateTime": self._int_prop("scheduledTransitionDateTime", 0),
             "scheduledTransitionDuration": self._int_prop("scheduledTransitionDuration", 0),
-            "previewActive": preview_active,
-            "previewTemperature": self._preview_temperature if preview_active else 0,
             "updatedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
 
@@ -956,108 +885,6 @@ class NightLight:
                     state["targetTemperature"], state["currentTemperature"], state["daylight"]
                 )
             )
-
-    # ---------- control ----------
-
-    def _write_config(self, key, value):
-        try:
-            result = subprocess.run(
-                ["kwriteconfig6", "--file", "kwinrc", "--group", "NightColor",
-                 "--key", key, str(value), "--notify"],
-                capture_output=True, text=True, timeout=5,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("kwriteconfig6 not found") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("kwriteconfig6 timed out") from exc
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"kwriteconfig6 failed for {key}: {(result.stderr or result.stdout).strip()}"
-            )
-
-    def _live_prop(self, name):
-        """Read a property straight from KWin (not the signal-fed cache)."""
-        return int(self._props_iface.Get(NIGHTLIGHT_IFACE, name))
-
-    def _wait_for_target(self, expected_target, timeout=2.0):
-        """Wait until KWin accepted the new target; the animation continues after."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                if self._live_prop("targetTemperature") == expected_target:
-                    return True
-            except dbus.DBusException:
-                return False
-            time.sleep(0.05)
-        return False
-
-    def apply(self, temperature=None, enabled=None, mode=None, apply_now=False):
-        """Persistent change: writes [NightColor] and lets KWin animate to it.
-
-        kwriteconfig6 --notify makes KWin's KConfigWatcher re-read kwinrc; without
-        --notify the file changes but KWin keeps its cached settings.
-        """
-        writes = []
-        if mode is not None:
-            if mode not in ("constant", "darklight"):
-                raise ValueError("mode must be 'constant' or 'darklight'")
-            writes.append(("Mode", 0 if mode == "constant" else 1))
-        if apply_now:
-            writes.append(("Mode", 0))
-            writes.append(("Active", "true"))
-        if temperature is not None:
-            writes.append(("NightTemperature", int(temperature)))
-        if enabled is not None:
-            writes.append(("Active", "true" if enabled else "false"))
-        if not writes:
-            raise ValueError("nothing to set: pass temperature, enabled, mode or applyNow")
-
-        merged = {}
-        for key, value in writes:
-            merged[key] = value
-        for key, value in merged.items():
-            self._write_config(key, value)
-        self._reload_config(force=True)
-
-        if temperature is not None:
-            applied = self._wait_for_target(int(temperature))
-        else:
-            time.sleep(0.25)
-            applied = True
-        self.refresh()
-        state = self.state()
-        result = {"applied": applied, "wrote": merged, "state": state}
-        if temperature is not None and not applied:
-            result["note"] = (
-                "Night Light is in daylight, so the night temperature takes effect at the "
-                "next transition; pass applyNow (or mode=constant) to force it now."
-            )
-        return result
-
-    def preview(self, temperature):
-        temperature = clamp(int(temperature), MIN_TEMPERATURE, MAX_TEMPERATURE)
-        self._nl_iface.preview(dbus.UInt32(temperature))
-        self._preview_temperature = temperature
-        self._preview_until = time.time() + PREVIEW_SECONDS
-        GLib.timeout_add_seconds(PREVIEW_SECONDS + 1, self._clear_preview_flag)
-        GLib.timeout_add(PUBLISH_INTERVAL_MS, self._flush_once)
-        return {"previewTemperature": temperature, "previewSeconds": PREVIEW_SECONDS,
-                "state": self.state()}
-
-    def stop_preview(self):
-        self._nl_iface.stopPreview()
-        self._clear_preview_flag()
-        GLib.timeout_add(PUBLISH_INTERVAL_MS, self._flush_once)
-        return {"state": self.state()}
-
-    def _clear_preview_flag(self):
-        self._preview_temperature = 0
-        self._preview_until = 0.0
-        return False
-
-    def _flush_once(self):
-        self._publish()
-        return False
 
 
 class ArtemisPublisher(threading.Thread):
@@ -1138,109 +965,6 @@ class KWinBridge(dbus.service.Object):
     def GetNightLightState(self):
         return json.dumps(self.nightlight.state())
 
-    @dbus.service.method('org.kde.kwin.WindowBridge', in_signature='u', out_signature='s')
-    def SetNightLightTemperature(self, temperature):
-        return json.dumps(self.nightlight.apply(temperature=int(temperature)))
-
-    @dbus.service.method('org.kde.kwin.WindowBridge', in_signature='u', out_signature='')
-    def PreviewNightLightTemperature(self, temperature):
-        self.nightlight.preview(int(temperature))
-
-    @dbus.service.method('org.kde.kwin.WindowBridge', in_signature='', out_signature='')
-    def StopNightLightPreview(self):
-        self.nightlight.stop_preview()
-
-
-class ControlHandler(BaseHTTPRequestHandler):
-    server_version = f"kwin-artemis-bridge/{BRIDGE_VERSION}"
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):  # noqa: A003 - silence per-request logging
-        pass
-
-    def _send(self, code, payload):
-        body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
-        if length > 65536:
-            raise ValueError("request body too large")
-        raw = self.rfile.read(length)
-        if not raw.strip():
-            return {}
-        return json.loads(raw)
-
-    def _nightlight(self):
-        return self.server.nightlight  # type: ignore[attr-defined]
-
-    def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
-        try:
-            if path == "/health":
-                self._send(200, {"ok": True, "version": BRIDGE_VERSION,
-                                 "port": CONTROL_PORT,
-                                 "nightlight": run_in_mainloop(self._nightlight().state)})
-            elif path == "/nightlight":
-                self._send(200, run_in_mainloop(self._nightlight().state))
-            else:
-                self._send(404, {"ok": False, "error": f"unknown path {path}"})
-        except Exception as exc:  # noqa: BLE001
-            self._send(500, {"ok": False, "error": str(exc)})
-
-    def do_POST(self):
-        path = self.path.split("?", 1)[0].rstrip("/")
-        try:
-            body = self._read_json()
-            nightlight = self._nightlight()
-            if path == "/nightlight":
-                if "temperature" in body and "nightTemperature" in body:
-                    raise ValueError("pass either temperature or nightTemperature, not both")
-                temperature = body.get("nightTemperature", body.get("temperature"))
-                if temperature is not None:
-                    temperature = int(temperature)
-                    if not MIN_TEMPERATURE <= temperature <= MAX_TEMPERATURE:
-                        raise ValueError(
-                            f"temperature must be {MIN_TEMPERATURE}..{MAX_TEMPERATURE} K"
-                        )
-                enabled = body.get("enabled")
-                mode = body.get("mode")
-                apply_now = bool(body.get("applyNow", body.get("apply_now", False)))
-
-                def do_apply():
-                    return nightlight.apply(
-                        temperature=temperature,
-                        enabled=None if enabled is None else bool(enabled),
-                        mode=mode,
-                        apply_now=apply_now,
-                    )
-
-                result = run_in_mainloop(do_apply, timeout=15)
-                result["ok"] = True
-                self._send(200, result)
-            elif path == "/nightlight/preview":
-                if "temperature" not in body:
-                    raise ValueError("pass temperature")
-                result = run_in_mainloop(nightlight.preview, int(body["temperature"]))
-                result["ok"] = True
-                self._send(200, result)
-            elif path in ("/nightlight/preview/stop", "/nightlight/stop-preview"):
-                result = run_in_mainloop(nightlight.stop_preview)
-                result["ok"] = True
-                self._send(200, result)
-            else:
-                self._send(404, {"ok": False, "error": f"unknown path {path}"})
-        except (ValueError, TypeError) as exc:
-            self._send(400, {"ok": False, "error": str(exc)})
-        except Exception as exc:  # noqa: BLE001
-            self._send(500, {"ok": False, "error": str(exc)})
-
 
 def register_schema(url, schema):
     try:
@@ -1310,15 +1034,6 @@ def main():
         return True
 
     GLib.timeout_add_seconds(HEARTBEAT_SECONDS, heartbeat)
-
-    try:
-        server = ThreadingHTTPServer((CONTROL_HOST, CONTROL_PORT), ControlHandler)
-        server.daemon_threads = True
-        server.nightlight = nightlight  # type: ignore[attr-defined]
-        threading.Thread(target=server.serve_forever, name="nightlight-http", daemon=True).start()
-        log(f"🌐 Night Light control API on http://{CONTROL_HOST}:{CONTROL_PORT}/nightlight")
-    except OSError as exc:
-        log(f"❌ HTTP control server unavailable on port {CONTROL_PORT}: {exc}")
 
     log("✅ KWin Artemis bridge ready")
     loop = GLib.MainLoop()
