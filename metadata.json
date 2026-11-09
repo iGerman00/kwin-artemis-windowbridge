@@ -1,0 +1,20 @@
+{
+    "KPlugin": {
+        "Name": "KWin Artemis WindowBridge",
+        "Description": "Send active window info and read/control Night Light over D-Bus for Artemis integration. Requires the Python receiver.",
+        "Icon": "preferences-system-windows",
+        "Authors": [
+            {
+                "Email": "igerman@igerman.cc",
+                "Name": "iGerman"
+            }
+        ],
+        "Id": "kwin-artemis-windowbridge",
+        "Version": "2.0.0",
+        "License": "MIT",
+        "Website": "https://igerman.cc"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPackageStructure": "KWin/Script"
+}
