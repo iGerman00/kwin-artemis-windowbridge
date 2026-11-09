@@ -515,6 +515,21 @@ NIGHTLIGHT_SCHEMA = {
             "title": "Colour Blue",
             "description": "Blue channel of colorHex (0-255)"
         },
+        "gainRed": {
+            "type": "number",
+            "title": "Gain Red (0..1)",
+            "description": "KWin's exact red channel factor at currentTemperature"
+        },
+        "gainGreen": {
+            "type": "number",
+            "title": "Gain Green (0..1)",
+            "description": "KWin's exact green channel factor at currentTemperature"
+        },
+        "gainBlue": {
+            "type": "number",
+            "title": "Gain Blue (0..1)",
+            "description": "KWin's exact blue channel factor at currentTemperature"
+        },
         "transitionActive": {
             "type": "boolean",
             "title": "Transition Active",
@@ -573,19 +588,81 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def kelvin_to_rgb(kelvin):
-    """Tanner Helland blackbody approximation, normalised to a full-scale channel."""
-    t = clamp(kelvin, MIN_TEMPERATURE, MAX_TEMPERATURE) / 100.0
-    if t <= 66:
-        red = 255.0
-        green = 99.4708025861 * math.log(t) - 161.1195681661
-        blue = 0.0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307
-    else:
-        red = 329.698727446 * ((t - 60) ** -0.1332047592)
-        green = 288.1221695283 * ((t - 60) ** -0.0755148492)
-        blue = 255.0
-    return tuple(int(clamp(round(c), 0, 255)) for c in (red, green, blue))
+# KWin's white-point table: src/3rdparty/colortemperature.h (Ingo Thies 2013, the
+# redshift colorramp), 1000-6500 K in 100 K steps. The values are gamma corrected;
+# KWin decodes them with a pure 2.2 curve and applies them as linear channel factors,
+# which for gamma-encoded pixels is the same as multiplying the encoded value by this
+# table entry. KWin interpolates linearly between two entries for other temperatures.
+BLACKBODY_1000_6500 = (
+    (1.00000000, 0.18172716, 0.00000000),  # 1000 K
+    (1.00000000, 0.25503671, 0.00000000),  # 1100 K
+    (1.00000000, 0.30942099, 0.00000000),  # 1200 K
+    (1.00000000, 0.35357379, 0.00000000),  # 1300 K
+    (1.00000000, 0.39091524, 0.00000000),  # 1400 K
+    (1.00000000, 0.42322816, 0.00000000),  # 1500 K
+    (1.00000000, 0.45159884, 0.00000000),  # 1600 K
+    (1.00000000, 0.47675916, 0.00000000),  # 1700 K
+    (1.00000000, 0.49923747, 0.00000000),  # 1800 K
+    (1.00000000, 0.51943421, 0.00000000),  # 1900 K
+    (1.00000000, 0.54360078, 0.08679949),  # 2000 K
+    (1.00000000, 0.56618736, 0.14065513),  # 2100 K
+    (1.00000000, 0.58734976, 0.18362641),  # 2200 K
+    (1.00000000, 0.60724493, 0.22137978),  # 2300 K
+    (1.00000000, 0.62600248, 0.25591950),  # 2400 K
+    (1.00000000, 0.64373109, 0.28819679),  # 2500 K
+    (1.00000000, 0.66052319, 0.31873863),  # 2600 K
+    (1.00000000, 0.67645822, 0.34786758),  # 2700 K
+    (1.00000000, 0.69160518, 0.37579588),  # 2800 K
+    (1.00000000, 0.70602449, 0.40267128),  # 2900 K
+    (1.00000000, 0.71976951, 0.42860152),  # 3000 K
+    (1.00000000, 0.73288760, 0.45366838),  # 3100 K
+    (1.00000000, 0.74542112, 0.47793608),  # 3200 K
+    (1.00000000, 0.75740814, 0.50145662),  # 3300 K
+    (1.00000000, 0.76888303, 0.52427322),  # 3400 K
+    (1.00000000, 0.77987699, 0.54642268),  # 3500 K
+    (1.00000000, 0.79041843, 0.56793692),  # 3600 K
+    (1.00000000, 0.80053332, 0.58884417),  # 3700 K
+    (1.00000000, 0.81024551, 0.60916971),  # 3800 K
+    (1.00000000, 0.81957693, 0.62893653),  # 3900 K
+    (1.00000000, 0.82854786, 0.64816570),  # 4000 K
+    (1.00000000, 0.83717703, 0.66687674),  # 4100 K
+    (1.00000000, 0.84548188, 0.68508786),  # 4200 K
+    (1.00000000, 0.85347859, 0.70281616),  # 4300 K
+    (1.00000000, 0.86118227, 0.72007777),  # 4400 K
+    (1.00000000, 0.86860704, 0.73688797),  # 4500 K
+    (1.00000000, 0.87576611, 0.75326132),  # 4600 K
+    (1.00000000, 0.88267187, 0.76921169),  # 4700 K
+    (1.00000000, 0.88933596, 0.78475236),  # 4800 K
+    (1.00000000, 0.89576933, 0.79989606),  # 4900 K
+    (1.00000000, 0.90198230, 0.81465502),  # 5000 K
+    (1.00000000, 0.90963069, 0.82838210),  # 5100 K
+    (1.00000000, 0.91710889, 0.84190889),  # 5200 K
+    (1.00000000, 0.92441842, 0.85523742),  # 5300 K
+    (1.00000000, 0.93156127, 0.86836903),  # 5400 K
+    (1.00000000, 0.93853986, 0.88130458),  # 5500 K
+    (1.00000000, 0.94535695, 0.89404470),  # 5600 K
+    (1.00000000, 0.95201559, 0.90658983),  # 5700 K
+    (1.00000000, 0.95851906, 0.91894041),  # 5800 K
+    (1.00000000, 0.96487079, 0.93109690),  # 5900 K
+    (1.00000000, 0.97107439, 0.94305985),  # 6000 K
+    (1.00000000, 0.97713351, 0.95482993),  # 6100 K
+    (1.00000000, 0.98305189, 0.96640795),  # 6200 K
+    (1.00000000, 0.98883326, 0.97779486),  # 6300 K
+    (1.00000000, 0.99448139, 0.98899179),  # 6400 K
+    (1.00000000, 1.00000000, 1.00000000),  # 6500 K
+)
 
+
+def kelvin_to_rgb(kelvin):
+    """KWin-exact white point (0..1 channel factors) for a colour temperature."""
+    if kelvin >= MAX_TEMPERATURE:
+        return (1.0, 1.0, 1.0)
+    kelvin = clamp(int(kelvin), MIN_TEMPERATURE, MAX_TEMPERATURE)
+    index = (kelvin - MIN_TEMPERATURE) // 100
+    blend = (kelvin % 100) / 100.0
+    low = BLACKBODY_1000_6500[index]
+    high = BLACKBODY_1000_6500[index + 1]
+    return tuple(low[c] * (1.0 - blend) + high[c] * blend for c in range(3))
 
 def read_nightcolor_config():
     """Read [NightColor] from kwinrc. KWin reloads it through KConfigWatcher."""
@@ -763,7 +840,10 @@ class NightLight:
 
         span = day - night
         warmth = clamp((day - current) / span, 0.0, 1.0) if span >= 100 else 0.0
-        red, green, blue = kelvin_to_rgb(current)
+        gain_red, gain_green, gain_blue = kelvin_to_rgb(current)
+        red = int(gain_red * 255.0 + 0.5)
+        green = int(gain_green * 255.0 + 0.5)
+        blue = int(gain_blue * 255.0 + 0.5)
 
         transition_active = current != target
         remaining = 0
@@ -795,6 +875,9 @@ class NightLight:
             "colorRed": red,
             "colorGreen": green,
             "colorBlue": blue,
+            "gainRed": round(gain_red, 6),
+            "gainGreen": round(gain_green, 6),
+            "gainBlue": round(gain_blue, 6),
             "transitionActive": transition_active,
             "transitionRemainingMs": remaining,
             "previousTransitionDateTime": self._int_prop("previousTransitionDateTime", 0),
