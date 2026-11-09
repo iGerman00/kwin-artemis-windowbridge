@@ -11,7 +11,8 @@ Night Light half (new in 2.0)
     /org/kde/KWin/NightLight. `currentTemperature` is the *animated* value, so it
     already reflects a transition in progress: while a transition runs KWin emits
     PropertiesChanged ~13x/s in 50 K steps. That state (plus derived values such as
-    `warmth` and `colorHex`) is published to the Artemis JSON module
+    `warmth`, `colorHex` and the `mulRed/Green/Blue` byte-space tint multipliers
+    for a multiply-blend layer) is published to the Artemis JSON module
     `kwin_nightlight`, throttled to one POST per 80 ms.
 
     KWin's D-Bus interface has no setter for the configured temperature, so:
@@ -63,7 +64,7 @@ import dbus.service
 import requests
 from gi.repository import GLib
 
-BRIDGE_VERSION = "2.0.0"
+BRIDGE_VERSION = "2.1.0"
 
 ARTEMIS_BASE_URL = "http://localhost:9696"
 WINDOW_MODULE_ID = "kwin_window"
@@ -84,6 +85,14 @@ MAX_TEMPERATURE = 6500
 DEFAULT_DAY_TEMPERATURE = 6500
 DEFAULT_NIGHT_TEMPERATURE = 4500
 PREVIEW_SECONDS = 15
+
+# Night Light is a gain applied to *linear* light, but the bytes Artemis passes
+# around are gamma encoded: a linear gain g reaches the wire as g**(1/gamma).
+# 2.2 is the curve KWin itself uses on both ends (the table is decoded with
+# gamma22 and its sRGB description is gamma22, not the piecewise sRGB curve),
+# so the byte-space factor is table**(1/2.2), not the raw table entry.
+# KWB_TINT_GAMMA overrides the exponent for fitting a specific strip.
+TINT_GAMMA = float(os.environ.get("KWB_TINT_GAMMA", "2.2"))
 
 # KWin emits currentTemperature every ~70 ms during a transition; one Artemis
 # POST per 80 ms keeps the module in sync without flooding the web server.
@@ -530,6 +539,27 @@ NIGHTLIGHT_SCHEMA = {
             "title": "Gain Blue (0..1)",
             "description": "KWin's exact blue channel factor at currentTemperature"
         },
+        "mulRed": {
+            "type": "integer",
+            "title": "Tint Red",
+            "description": "Red multiplier for a multiply-blend layer: 255 * gainRed^(1/tintGamma). "
+                           "Gains are linear-light, encoded bytes need the root."
+        },
+        "mulGreen": {
+            "type": "integer",
+            "title": "Tint Green",
+            "description": "Green multiplier for a multiply-blend layer: 255 * gainGreen^(1/tintGamma)"
+        },
+        "mulBlue": {
+            "type": "integer",
+            "title": "Tint Blue",
+            "description": "Blue multiplier for a multiply-blend layer: 255 * gainBlue^(1/tintGamma)"
+        },
+        "tintGamma": {
+            "type": "number",
+            "title": "Tint Gamma",
+            "description": "Exponent used for mulRed/mulGreen/mulBlue (KWB_TINT_GAMMA, default 2.2)"
+        },
         "transitionActive": {
             "type": "boolean",
             "title": "Transition Active",
@@ -589,10 +619,20 @@ def clamp(value, low, high):
 
 
 # KWin's white-point table: src/3rdparty/colortemperature.h (Ingo Thies 2013, the
-# redshift colorramp), 1000-6500 K in 100 K steps. The values are gamma corrected;
-# KWin decodes them with a pure 2.2 curve and applies them as linear channel factors,
-# which for gamma-encoded pixels is the same as multiplying the encoded value by this
-# table entry. KWin interpolates linearly between two entries for other temperatures.
+# redshift colorramp), 1000-6500 K in 100 K steps, linear interpolation between
+# entries.
+#
+# The entries are gamma-corrected numbers and KWin does not multiply pixels by
+# them: it decodes them (gamma 2.2) to move the output's white point, and the
+# compositor then converts into that description with a Bradford chromatic
+# adaptation. The net change to the panel's encoded bytes is much gentler than
+# the raw entry. Measured against the panel, the byte-space multiplier is
+# entry**(1/2.2): 2500 K behaves like a linear gain of 0.644, so the wire sees
+# 209/255 green, not 164/255. Treating the entry as an encoded multiplier (the
+# obvious reading) comes out 2.2x too warm.
+#
+# colorRed/Green/Blue publish the raw entries; mulRed/Green/Blue publish the
+# byte-space multipliers a multiply-blend layer needs.
 BLACKBODY_1000_6500 = (
     (1.00000000, 0.18172716, 0.00000000),  # 1000 K
     (1.00000000, 0.25503671, 0.00000000),  # 1100 K
@@ -844,6 +884,10 @@ class NightLight:
         red = int(gain_red * 255.0 + 0.5)
         green = int(gain_green * 255.0 + 0.5)
         blue = int(gain_blue * 255.0 + 0.5)
+        # Byte-space equivalents of the linear gains, for a multiply-blend layer.
+        mul_red = int(clamp(gain_red ** (1.0 / TINT_GAMMA) * 255.0 + 0.5, 0, 255))
+        mul_green = int(clamp(gain_green ** (1.0 / TINT_GAMMA) * 255.0 + 0.5, 0, 255))
+        mul_blue = int(clamp(gain_blue ** (1.0 / TINT_GAMMA) * 255.0 + 0.5, 0, 255))
 
         transition_active = current != target
         remaining = 0
@@ -878,6 +922,10 @@ class NightLight:
             "gainRed": round(gain_red, 6),
             "gainGreen": round(gain_green, 6),
             "gainBlue": round(gain_blue, 6),
+            "mulRed": mul_red,
+            "mulGreen": mul_green,
+            "mulBlue": mul_blue,
+            "tintGamma": TINT_GAMMA,
             "transitionActive": transition_active,
             "transitionRemainingMs": remaining,
             "previousTransitionDateTime": self._int_prop("previousTransitionDateTime", 0),

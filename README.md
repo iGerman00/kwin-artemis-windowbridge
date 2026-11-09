@@ -32,7 +32,8 @@ Installs the KWin script to `~/.local/share/kwin/scripts/kwin-artemis-windowbrid
 `kwin_nightlight` — Night Light state. `currentTemperature` is KWin's *animated* value: it follows transitions in 50 K steps (~13 updates/s), so no interpolation is needed. Derived fields:
 
 - `warmth` — 0 at the day temperature, 1 at the configured night temperature
-- `colorRed`/`colorGreen`/`colorBlue` (0-255, integer) and `gainRed`/`gainGreen`/`gainBlue` (0..1, number) — KWin's own white-point table at `currentTemperature`, i.e. the exact per-channel multiply factors, ready for a Multiply layer. `colorHex` is the same value as a string for humans; colour node inputs need the numbers.
+- `colorRed`/`colorGreen`/`colorBlue` (0-255, integer) and `gainRed`/`gainGreen`/`gainBlue` (0..1, number) — KWin's own white-point table at `currentTemperature`. `colorHex` is the same value as a string for humans; colour node inputs need the numbers.
+- `mulRed`/`mulGreen`/`mulBlue` (0-255, integer) — the same tint as bytes for a Multiply layer: `255 * gain^(1/tintGamma)`. KWin's entries are gamma-corrected and the gain is applied to linear light, so the raw entries are 2.2× too warm on the wire; a Multiply layer wants these, not `color*`. `tintGamma` reports the exponent (`KWB_TINT_GAMMA`, default 2.2).
 - `enabled`, `running`, `active`, `inhibited`, `daylight`, `modeName`, `targetTemperature`, `dayTemperature`, `nightTemperature`, `transitionActive`, `transitionRemainingMs`, transition timestamps, `previewActive`
 
 ## Control
