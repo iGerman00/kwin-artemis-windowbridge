@@ -49,3 +49,7 @@ Fields:
 ## Notes
 
 - KWin scripts have no timers and cannot subscribe to D-Bus properties, so the Night Light side lives in the receiver.
+
+## AI Disclosure
+
+Vibe-coded, verified against my own machine only, I've been using this for many months. YMMV.
